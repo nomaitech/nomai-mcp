@@ -15,11 +15,15 @@ spec:
       labels:
         app: nomai-mcp
     spec:
+      # Otherwise Kubernetes injects Docker-links-style env vars for every
+      # Service in the namespace, e.g. NOMAI_MCP_PORT=tcp://<ip>:80 — which
+      # collides with and overrides our own NOMAI_MCP_PORT app setting.
+      enableServiceLinks: false
       imagePullSecrets:
         - name: regcred
       containers:
         - name: nomai-mcp
-          image: pdr.jonbesga.com/nomai-mcp:latest
+          image: pdr.jonbesga.com/nomai-mcp:8c940c9
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
