@@ -3,7 +3,7 @@ import logging
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
-from nomai_mcp.auth import JWKSTokenVerifier
+from nomai_mcp.auth import GoogleTokenVerifier
 from nomai_mcp.settings import Settings
 
 logging.basicConfig(level=logging.INFO)
@@ -14,9 +14,9 @@ mcp = FastMCP(
     "nomai-mcp",
     host=settings.host,
     port=settings.port,
-    token_verifier=JWKSTokenVerifier(settings),
+    token_verifier=GoogleTokenVerifier(settings),
     auth=AuthSettings(
-        issuer_url=settings.oauth_issuer_url,
+        issuer_url="https://accounts.google.com",
         resource_server_url=settings.resource_server_url,
         required_scopes=settings.required_scopes,
     ),
