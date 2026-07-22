@@ -29,3 +29,9 @@ class Settings(BaseSettings):
     # Only these emails are allowed to use the server (Google login alone
     # doesn't restrict to your company unless you're on real Workspace).
     allowed_emails: list[str]
+
+    # Where registered OAuth clients / issued tokens are persisted to disk,
+    # so redeploys (which recreate the pod) don't force every MCP client to
+    # rediscover and re-authenticate. In k8s this should point at a mounted
+    # PersistentVolume; the default is fine for local dev.
+    state_path: str = "oauth_state.json"

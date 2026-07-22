@@ -1,6 +1,7 @@
 import logging
 import secrets
 import time
+from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
@@ -13,7 +14,7 @@ from mcp.server.auth.provider import (
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, BaseModel
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
@@ -29,6 +30,25 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
 
+class PendingAuthorization(BaseModel):
+    """The original MCP client's authorization request, kept around while
+    the user is off completing the Google login step."""
+
+    redirect_uri: str
+    code_challenge: str | None
+    redirect_uri_provided_explicitly: bool
+    client_id: str
+    resource: str | None
+    original_state: str | None
+
+
+class PersistedState(BaseModel):
+    clients: dict[str, OAuthClientInformationFull] = {}
+    auth_codes: dict[str, AuthorizationCode] = {}
+    tokens: dict[str, AccessToken] = {}
+    state_mapping: dict[str, PendingAuthorization] = {}
+
+
 class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     """MCP Authorization Server that proxies human login to Google.
 
@@ -39,22 +59,48 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
     the resulting email is checked against an allowlist before this server
     mints its own MCP access token.
 
-    All state is in-memory: registered clients, in-flight authorization
-    codes, and issued tokens are lost on restart, and refresh tokens are not
-    supported (clients simply re-authenticate once their token expires).
+    Registered clients, in-flight authorization codes, and issued tokens are
+    persisted to `settings.state_path` on every change and reloaded at
+    startup, so a redeploy doesn't force every MCP client to re-register and
+    every user to re-authenticate. Refresh tokens are still not supported
+    (clients simply re-authenticate once their token expires).
     """
 
     def __init__(self, settings: Settings):
         self._settings = settings
         self._allowed_emails = {e.lower() for e in settings.allowed_emails}
         self._google_redirect_uri = f"{str(settings.server_url).rstrip('/')}/google/callback"
+        self._state_path = Path(settings.state_path)
 
-        self.clients: dict[str, OAuthClientInformationFull] = {}
-        self.auth_codes: dict[str, AuthorizationCode] = {}
-        self.tokens: dict[str, AccessToken] = {}
+        state = self._load()
+        self.clients: dict[str, OAuthClientInformationFull] = state.clients
+        self.auth_codes: dict[str, AuthorizationCode] = state.auth_codes
+        self.tokens: dict[str, AccessToken] = state.tokens
         # state -> the original MCP client's authorization request, kept
         # around while the user is off completing the Google login step.
-        self.state_mapping: dict[str, dict[str, object]] = {}
+        self.state_mapping: dict[str, PendingAuthorization] = state.state_mapping
+
+    # --- persistence -----------------------------------------------------------
+
+    def _load(self) -> PersistedState:
+        if not self._state_path.exists():
+            return PersistedState()
+        try:
+            return PersistedState.model_validate_json(self._state_path.read_text())
+        except ValueError:
+            logger.warning("Failed to parse OAuth state file %s, starting empty", self._state_path)
+            return PersistedState()
+
+    def _save(self) -> None:
+        state = PersistedState(
+            clients=self.clients,
+            auth_codes=self.auth_codes,
+            tokens=self.tokens,
+            state_mapping=self.state_mapping,
+        )
+        tmp_path = self._state_path.with_suffix(".tmp")
+        tmp_path.write_text(state.model_dump_json())
+        tmp_path.replace(self._state_path)
 
     # --- client registration -------------------------------------------------
 
@@ -63,19 +109,21 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self.clients[client_info.client_id] = client_info
+        self._save()
 
     # --- authorization (proxies to Google) -----------------------------------
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         state = secrets.token_hex(16)
-        self.state_mapping[state] = {
-            "redirect_uri": str(params.redirect_uri),
-            "code_challenge": params.code_challenge,
-            "redirect_uri_provided_explicitly": params.redirect_uri_provided_explicitly,
-            "client_id": client.client_id,
-            "resource": params.resource,
-            "original_state": params.state,
-        }
+        self.state_mapping[state] = PendingAuthorization(
+            redirect_uri=str(params.redirect_uri),
+            code_challenge=params.code_challenge,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            client_id=client.client_id,
+            resource=str(params.resource) if params.resource else None,
+            original_state=params.state,
+        )
+        self._save()
 
         query = urlencode(
             {
@@ -137,21 +185,22 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
         new_code = f"mcp_{secrets.token_hex(16)}"
         self.auth_codes[new_code] = AuthorizationCode(
             code=new_code,
-            client_id=state_data["client_id"],  # type: ignore[arg-type]
-            redirect_uri=AnyHttpUrl(state_data["redirect_uri"]),  # type: ignore[arg-type]
-            redirect_uri_provided_explicitly=state_data["redirect_uri_provided_explicitly"],  # type: ignore[arg-type]
+            client_id=state_data.client_id,
+            redirect_uri=AnyHttpUrl(state_data.redirect_uri),
+            redirect_uri_provided_explicitly=state_data.redirect_uri_provided_explicitly,
             expires_at=time.time() + 300,
             scopes=[MCP_SCOPE],
-            code_challenge=state_data["code_challenge"],  # type: ignore[arg-type]
-            resource=state_data["resource"],  # type: ignore[arg-type]
+            code_challenge=state_data.code_challenge,
+            resource=state_data.resource,
             subject=email,
         )
         del self.state_mapping[state]
+        self._save()
 
         redirect_url = construct_redirect_uri(
-            state_data["redirect_uri"],  # type: ignore[arg-type]
+            state_data.redirect_uri,
             code=new_code,
-            state=state_data["original_state"],  # type: ignore[arg-type]
+            state=state_data.original_state,
         )
         return RedirectResponse(url=redirect_url, status_code=302)
 
@@ -178,6 +227,7 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             subject=authorization_code.subject,
         )
         del self.auth_codes[authorization_code.code]
+        self._save()
 
         return OAuthToken(
             access_token=mcp_token,
@@ -205,8 +255,10 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             return None
         if access_token.expires_at and access_token.expires_at < time.time():
             del self.tokens[token]
+            self._save()
             return None
         return access_token
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        self.tokens.pop(token.token, None)
+        if self.tokens.pop(token.token, None) is not None:
+            self._save()
