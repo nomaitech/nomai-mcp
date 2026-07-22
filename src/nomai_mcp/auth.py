@@ -1,52 +1,212 @@
 import logging
+import secrets
+import time
+from urllib.parse import urlencode
 
 import httpx
-from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+from starlette.responses import RedirectResponse, Response
 
 from nomai_mcp.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+MCP_SCOPE = "mcp"
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
 
-class GoogleTokenVerifier(TokenVerifier):
-    """Validates bearer tokens by asking Google's tokeninfo endpoint about them.
+class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
+    """MCP Authorization Server that proxies human login to Google.
 
-    Google's OAuth access tokens are opaque (not JWTs), so they can't be
-    checked locally against a JWKS — instead each request is verified by
-    calling Google, then the caller's email is checked against an allowlist
-    (Google login alone doesn't restrict who can call this server).
+    MCP clients (Claude Code, etc.) register with and authenticate against
+    THIS server via standard OAuth 2.1 + Dynamic Client Registration — no
+    Google credentials ever touch them. Internally, the actual login step
+    redirects to Google using one confidential OAuth client held here, and
+    the resulting email is checked against an allowlist before this server
+    mints its own MCP access token.
+
+    All state is in-memory: registered clients, in-flight authorization
+    codes, and issued tokens are lost on restart, and refresh tokens are not
+    supported (clients simply re-authenticate once their token expires).
     """
 
     def __init__(self, settings: Settings):
         self._settings = settings
         self._allowed_emails = {e.lower() for e in settings.allowed_emails}
+        self._google_redirect_uri = f"{str(settings.server_url).rstrip('/')}/google/callback"
 
-    async def verify_token(self, token: str) -> AccessToken | None:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(GOOGLE_TOKENINFO_URL, params={"access_token": token})
+        self.clients: dict[str, OAuthClientInformationFull] = {}
+        self.auth_codes: dict[str, AuthorizationCode] = {}
+        self.tokens: dict[str, AccessToken] = {}
+        # state -> the original MCP client's authorization request, kept
+        # around while the user is off completing the Google login step.
+        self.state_mapping: dict[str, dict[str, object]] = {}
 
-        if response.status_code != 200:
-            logger.warning("Rejected token: tokeninfo returned %s", response.status_code)
-            return None
+    # --- client registration -------------------------------------------------
 
-        info = response.json()
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self.clients.get(client_id)
 
-        if info.get("aud") != self._settings.google_client_id:
-            logger.warning("Rejected token: audience mismatch")
-            return None
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self.clients[client_info.client_id] = client_info
 
+    # --- authorization (proxies to Google) -----------------------------------
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        state = secrets.token_hex(16)
+        self.state_mapping[state] = {
+            "redirect_uri": str(params.redirect_uri),
+            "code_challenge": params.code_challenge,
+            "redirect_uri_provided_explicitly": params.redirect_uri_provided_explicitly,
+            "client_id": client.client_id,
+            "resource": params.resource,
+            "original_state": params.state,
+        }
+
+        query = urlencode(
+            {
+                "response_type": "code",
+                "client_id": self._settings.google_client_id,
+                "redirect_uri": self._google_redirect_uri,
+                "scope": "openid email",
+                "state": state,
+                "access_type": "online",
+                "prompt": "select_account",
+            }
+        )
+        return f"{GOOGLE_AUTH_URL}?{query}"
+
+    async def handle_google_callback(self, request: Request) -> Response:
+        """Route handler for GET /google/callback, Google's redirect target."""
+        error = request.query_params.get("error")
+        if error:
+            raise HTTPException(400, f"Google login failed: {error}")
+
+        code = request.query_params.get("code")
+        state = request.query_params.get("state")
+        if not code or not state:
+            raise HTTPException(400, "Missing code or state parameter")
+
+        state_data = self.state_mapping.get(state)
+        if not state_data:
+            raise HTTPException(400, "Invalid or expired state parameter")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            token_response = await client.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": self._settings.google_client_id,
+                    "client_secret": self._settings.google_client_secret,
+                    "redirect_uri": self._google_redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+        if token_response.status_code != 200:
+            logger.warning("Google token exchange failed: %s", token_response.text)
+            raise HTTPException(401, "Google token exchange failed")
+
+        google_access_token = token_response.json()["access_token"]
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            info_response = await client.get(GOOGLE_TOKENINFO_URL, params={"access_token": google_access_token})
+        if info_response.status_code != 200:
+            raise HTTPException(401, "Failed to verify Google token")
+
+        info = info_response.json()
         email = info.get("email", "").lower()
         email_verified = str(info.get("email_verified")).lower() == "true"
         if not email_verified or email not in self._allowed_emails:
-            logger.warning("Rejected token: email %r not allowed", email)
-            return None
+            logger.warning("Rejected login: email %r not allowed", email)
+            raise HTTPException(403, f"{email or 'this account'} is not authorized to use this server")
 
-        return AccessToken(
-            token=token,
-            client_id=info.get("azp", info.get("aud", "unknown")),
-            scopes=info.get("scope", "").split(),
-            subject=info.get("sub"),
-            claims=info,
+        new_code = f"mcp_{secrets.token_hex(16)}"
+        self.auth_codes[new_code] = AuthorizationCode(
+            code=new_code,
+            client_id=state_data["client_id"],  # type: ignore[arg-type]
+            redirect_uri=AnyHttpUrl(state_data["redirect_uri"]),  # type: ignore[arg-type]
+            redirect_uri_provided_explicitly=state_data["redirect_uri_provided_explicitly"],  # type: ignore[arg-type]
+            expires_at=time.time() + 300,
+            scopes=[MCP_SCOPE],
+            code_challenge=state_data["code_challenge"],  # type: ignore[arg-type]
+            resource=state_data["resource"],  # type: ignore[arg-type]
+            subject=email,
         )
+        del self.state_mapping[state]
+
+        redirect_url = construct_redirect_uri(
+            state_data["redirect_uri"],  # type: ignore[arg-type]
+            code=new_code,
+            state=state_data["original_state"],  # type: ignore[arg-type]
+        )
+        return RedirectResponse(url=redirect_url, status_code=302)
+
+    # --- authorization code / token exchange ---------------------------------
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        return self.auth_codes.get(authorization_code)
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        if authorization_code.code not in self.auth_codes:
+            raise ValueError("Invalid authorization code")
+
+        mcp_token = f"mcp_{secrets.token_hex(32)}"
+        self.tokens[mcp_token] = AccessToken(
+            token=mcp_token,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + 3600,
+            resource=authorization_code.resource,
+            subject=authorization_code.subject,
+        )
+        del self.auth_codes[authorization_code.code]
+
+        return OAuthToken(
+            access_token=mcp_token,
+            token_type="Bearer",
+            expires_in=3600,
+            scope=" ".join(authorization_code.scopes),
+        )
+
+    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
+        return None
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        raise NotImplementedError("Refresh tokens are not supported — clients re-authenticate on expiry")
+
+    # --- resource server side (FastMCP wraps this in a TokenVerifier itself) -
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        access_token = self.tokens.get(token)
+        if not access_token:
+            return None
+        if access_token.expires_at and access_token.expires_at < time.time():
+            del self.tokens[token]
+            return None
+        return access_token
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        self.tokens.pop(token.token, None)

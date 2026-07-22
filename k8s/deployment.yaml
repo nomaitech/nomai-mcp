@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nomai-mcp
+  namespace: jon
+  labels:
+    app: nomai-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nomai-mcp
+  template:
+    metadata:
+      labels:
+        app: nomai-mcp
+    spec:
+      imagePullSecrets:
+        - name: regcred
+      containers:
+        - name: nomai-mcp
+          image: pdr.jonbesga.com/nomai-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: nomai-mcp-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nomai-mcp
+  namespace: jon
+  labels:
+    app: nomai-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: nomai-mcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
