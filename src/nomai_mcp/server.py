@@ -29,6 +29,12 @@ def ping() -> str:
     return "pong"
 
 
+@mcp.tool()
+def who_is_the_owner() -> str:
+    """Mock tool: answers who owns this server."""
+    return "Carlos The Great"
+
+
 def main() -> None:
     mcp.run(transport="streamable-http")
 
