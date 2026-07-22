@@ -23,7 +23,7 @@ spec:
         - name: regcred
       containers:
         - name: nomai-mcp
-          image: pdr.jonbesga.com/nomai-mcp:8c940c9
+          image: pdr.jonbesga.com/nomai-mcp:d7b8abb
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
