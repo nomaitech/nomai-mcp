@@ -40,6 +40,13 @@ token to confirm auth is wired up correctly.
 
 ## Connecting a client
 
+When adding this as a custom connector, use the full MCP endpoint URL,
+including the path — e.g. `https://mcp.nomaitech.com/mcp` — not just the
+bare domain. The OAuth discovery/login endpoints live at the domain root,
+but the actual MCP protocol (streamable-HTTP transport) is only served at
+`/mcp`; pointing a client at the bare domain will authenticate successfully
+and then fail to find any server, since `/` itself returns 404.
+
 Google doesn't support OAuth Dynamic Client Registration, so MCP clients
 (Claude Code, Claude.ai, etc.) will need the Client ID from setup step 1
 configured manually rather than discovering it automatically — this is an
