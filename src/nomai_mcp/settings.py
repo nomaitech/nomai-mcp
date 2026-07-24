@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     google_client_id: str
     google_client_secret: str
 
+    # Gemini API key (from Google AI Studio) used by the image generation
+    # tool. Unrelated to the OAuth client above — that's for login only.
+    gemini_api_key: str
+
     # Only these emails are allowed to use the server (Google login alone
     # doesn't restrict to your company unless you're on real Workspace).
     allowed_emails: list[str]
