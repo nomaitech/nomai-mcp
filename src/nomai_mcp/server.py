@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 settings = Settings()
 
-GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
+GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 
 genai_client = genai.Client(api_key=settings.gemini_api_key)
 
