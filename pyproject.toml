@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.28.1",
     "httpx>=0.28.1",
-    "google-genai>=2.10.0",
 ]
 
 [project.scripts]

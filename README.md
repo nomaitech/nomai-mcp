@@ -38,13 +38,6 @@ Add `@mcp.tool()`-decorated functions in `src/nomai_mcp/server.py`. A `ping`
 tool is included as a health check — call it once your client has a valid
 token to confirm auth is wired up correctly.
 
-`generate_image` generates images from a text prompt (optionally guided by
-base64-encoded reference images) via the Gemini API's Interactions endpoint,
-using the Gemini 3.1 Flash Image model. It requires a
-`NOMAI_MCP_GEMINI_API_KEY` (from [Google AI
-Studio](https://aistudio.google.com/apikey)) — separate from the Google
-OAuth client used for login.
-
 ## Connecting a client
 
 When adding this as a custom connector, use the full MCP endpoint URL,
