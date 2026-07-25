@@ -24,6 +24,9 @@ from nomai_mcp.settings import Settings
 logger = logging.getLogger(__name__)
 
 MCP_SCOPE = "mcp"
+OFFLINE_ACCESS_SCOPE = "offline_access"
+
+REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 90  # 90 days
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -40,12 +43,14 @@ class PendingAuthorization(BaseModel):
     client_id: str
     resource: str | None
     original_state: str | None
+    scopes: list[str]
 
 
 class PersistedState(BaseModel):
     clients: dict[str, OAuthClientInformationFull] = {}
     auth_codes: dict[str, AuthorizationCode] = {}
     tokens: dict[str, AccessToken] = {}
+    refresh_tokens: dict[str, RefreshToken] = {}
     state_mapping: dict[str, PendingAuthorization] = {}
 
 
@@ -62,8 +67,9 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
     Registered clients, in-flight authorization codes, and issued tokens are
     persisted to `settings.state_path` on every change and reloaded at
     startup, so a redeploy doesn't force every MCP client to re-register and
-    every user to re-authenticate. Refresh tokens are still not supported
-    (clients simply re-authenticate once their token expires).
+    every user to re-authenticate. Clients that request the `offline_access`
+    scope get a rotating refresh token so they can renew silently instead of
+    repeating the Google login every hour.
     """
 
     def __init__(self, settings: Settings):
@@ -76,6 +82,7 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
         self.clients: dict[str, OAuthClientInformationFull] = state.clients
         self.auth_codes: dict[str, AuthorizationCode] = state.auth_codes
         self.tokens: dict[str, AccessToken] = state.tokens
+        self.refresh_tokens: dict[str, RefreshToken] = state.refresh_tokens
         # state -> the original MCP client's authorization request, kept
         # around while the user is off completing the Google login step.
         self.state_mapping: dict[str, PendingAuthorization] = state.state_mapping
@@ -96,6 +103,7 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             clients=self.clients,
             auth_codes=self.auth_codes,
             tokens=self.tokens,
+            refresh_tokens=self.refresh_tokens,
             state_mapping=self.state_mapping,
         )
         tmp_path = self._state_path.with_suffix(".tmp")
@@ -122,6 +130,7 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             client_id=client.client_id,
             resource=str(params.resource) if params.resource else None,
             original_state=params.state,
+            scopes=params.scopes or [MCP_SCOPE],
         )
         self._save()
 
@@ -189,7 +198,7 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             redirect_uri=AnyHttpUrl(state_data.redirect_uri),
             redirect_uri_provided_explicitly=state_data.redirect_uri_provided_explicitly,
             expires_at=time.time() + 300,
-            scopes=[MCP_SCOPE],
+            scopes=state_data.scopes,
             code_challenge=state_data.code_challenge,
             resource=state_data.resource,
             subject=email,
@@ -226,6 +235,18 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             resource=authorization_code.resource,
             subject=authorization_code.subject,
         )
+
+        new_refresh_token: str | None = None
+        if OFFLINE_ACCESS_SCOPE in authorization_code.scopes:
+            new_refresh_token = f"mcp_refresh_{secrets.token_hex(32)}"
+            self.refresh_tokens[new_refresh_token] = RefreshToken(
+                token=new_refresh_token,
+                client_id=client.client_id,
+                scopes=authorization_code.scopes,
+                expires_at=int(time.time()) + REFRESH_TOKEN_TTL_SECONDS,
+                subject=authorization_code.subject,
+            )
+
         del self.auth_codes[authorization_code.code]
         self._save()
 
@@ -234,10 +255,11 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
             token_type="Bearer",
             expires_in=3600,
             scope=" ".join(authorization_code.scopes),
+            refresh_token=new_refresh_token,
         )
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
-        return None
+        return self.refresh_tokens.get(refresh_token)
 
     async def exchange_refresh_token(
         self,
@@ -245,7 +267,37 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        raise NotImplementedError("Refresh tokens are not supported — clients re-authenticate on expiry")
+        # Rotate: the old refresh token is single-use, per OAuth 2.1's
+        # requirement for public clients (DCR/CIMD registrants have no
+        # client secret to prove possession, so rotation limits replay).
+        del self.refresh_tokens[refresh_token.token]
+
+        mcp_token = f"mcp_{secrets.token_hex(32)}"
+        self.tokens[mcp_token] = AccessToken(
+            token=mcp_token,
+            client_id=client.client_id,
+            scopes=scopes,
+            expires_at=int(time.time()) + 3600,
+            subject=refresh_token.subject,
+        )
+
+        new_refresh_token = f"mcp_refresh_{secrets.token_hex(32)}"
+        self.refresh_tokens[new_refresh_token] = RefreshToken(
+            token=new_refresh_token,
+            client_id=client.client_id,
+            scopes=scopes,
+            expires_at=int(time.time()) + REFRESH_TOKEN_TTL_SECONDS,
+            subject=refresh_token.subject,
+        )
+        self._save()
+
+        return OAuthToken(
+            access_token=mcp_token,
+            token_type="Bearer",
+            expires_in=3600,
+            scope=" ".join(scopes),
+            refresh_token=new_refresh_token,
+        )
 
     # --- resource server side (FastMCP wraps this in a TokenVerifier itself) -
 
@@ -260,5 +312,7 @@ class GoogleProxyOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCod
         return access_token
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        if self.tokens.pop(token.token, None) is not None:
+        removed = self.tokens.pop(token.token, None) is not None
+        removed = self.refresh_tokens.pop(token.token, None) is not None or removed
+        if removed:
             self._save()

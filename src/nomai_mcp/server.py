@@ -10,7 +10,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import Response
 
-from nomai_mcp.auth import MCP_SCOPE, GoogleProxyOAuthProvider
+from nomai_mcp.auth import MCP_SCOPE, OFFLINE_ACCESS_SCOPE, GoogleProxyOAuthProvider
 from nomai_mcp.settings import Settings
 
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +32,7 @@ mcp = FastMCP(
         required_scopes=[MCP_SCOPE],
         client_registration_options=ClientRegistrationOptions(
             enabled=True,
-            valid_scopes=[MCP_SCOPE],
+            valid_scopes=[MCP_SCOPE, OFFLINE_ACCESS_SCOPE],
             default_scopes=[MCP_SCOPE],
         ),
     ),
