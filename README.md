@@ -38,9 +38,10 @@ Add `@mcp.tool()`-decorated functions in `src/nomai_mcp/server.py`. A `ping`
 tool is included as a health check — call it once your client has a valid
 token to confirm auth is wired up correctly.
 
-`things_to_do_in_london_this_weekend` scrapes londonist.com/things-to-do,
-follows the current "Things To Do In London This Weekend" article link, and
-returns its events grouped by section.
+`things_to_do_in_london_this_weekend` and `things_to_do_in_london_this_week`
+scrape londonist.com/things-to-do, follow the current "Things To Do In
+London This Weekend" / "This Week" article link, and return its events
+grouped by section.
 
 ## Connecting a client
 

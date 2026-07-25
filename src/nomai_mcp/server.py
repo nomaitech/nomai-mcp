@@ -67,15 +67,11 @@ _SCRAPE_HEADERS = {
     ),
 }
 
-_WEEKEND_LINK_RE = re.compile(r"things to do in london this weekend", re.IGNORECASE)
+_WEEKEND_LINK_RE = re.compile(r"^\s*things to do in london this weekend", re.IGNORECASE)
+_WEEK_LINK_RE = re.compile(r"^\s*things to do in london this week\b", re.IGNORECASE)
 
 
-@mcp.tool()
-async def things_to_do_in_london_this_weekend() -> str:
-    """Scrape londonist.com for the current "Things To Do In London This
-    Weekend" article and return its events, grouped by section (e.g. "All
-    weekend", "Saturday", "Sunday").
-    """
+async def _scrape_londonist_article(link_re: re.Pattern[str], default_title: str) -> str:
     async with httpx.AsyncClient(
         headers=_SCRAPE_HEADERS, timeout=15.0, follow_redirects=True
     ) as client:
@@ -83,10 +79,10 @@ async def things_to_do_in_london_this_weekend() -> str:
         index_response.raise_for_status()
         index_soup = BeautifulSoup(index_response.text, "html.parser")
 
-        link = index_soup.find("a", string=_WEEKEND_LINK_RE)
+        link = index_soup.find("a", string=link_re)
         if link is None or not link.get("href"):
-            logger.warning("Could not find 'this weekend' link on %s", LONDONIST_THINGS_TO_DO_URL)
-            raise HTTPException(502, "Could not find the 'Things To Do This Weekend' link")
+            logger.warning("Could not find %r link on %s", link_re.pattern, LONDONIST_THINGS_TO_DO_URL)
+            raise HTTPException(502, f"Could not find the {default_title!r} link")
 
         article_url = urljoin(LONDONIST_BASE_URL, link["href"])
 
@@ -95,7 +91,7 @@ async def things_to_do_in_london_this_weekend() -> str:
         article_soup = BeautifulSoup(article_response.text, "html.parser")
 
     title_tag = article_soup.find("h1")
-    title = title_tag.get_text(strip=True) if title_tag else "Things To Do In London This Weekend"
+    title = title_tag.get_text(strip=True) if title_tag else default_title
 
     body = article_soup.find(attrs={"itemprop": "articleBody"})
     if body is None:
@@ -110,6 +106,24 @@ async def things_to_do_in_london_this_weekend() -> str:
         lines.append(f"## {text}" if element.name == "h2" else f"- {text}")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def things_to_do_in_london_this_weekend() -> str:
+    """Scrape londonist.com for the current "Things To Do In London This
+    Weekend" article and return its events, grouped by section (e.g. "All
+    weekend", "Saturday", "Sunday").
+    """
+    return await _scrape_londonist_article(_WEEKEND_LINK_RE, "Things To Do In London This Weekend")
+
+
+@mcp.tool()
+async def things_to_do_in_london_this_week() -> str:
+    """Scrape londonist.com for the current "Things To Do In London This
+    Week" article and return its events, grouped by section (e.g. "All
+    week", "Today's events: Monday").
+    """
+    return await _scrape_londonist_article(_WEEK_LINK_RE, "Things To Do In London This Week")
 
 
 def main() -> None:
